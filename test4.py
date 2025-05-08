@@ -1,8 +1,9 @@
+#依旧太慢
 import pulp
 import itertools
 
 # --------------------------
-# 参数设定（可修改）
+# 参数设定
 # --------------------------
 
 saw_kerf = 0.005  # 锯口宽度
@@ -20,38 +21,76 @@ materials = {
     3: {"length": 7.8, "cost": 28},
 }
 
+defect_info = {
+    1: [(1.0, 0.03), (2.5, 0.04)],
+    2: [(0.5, 0.02), (1.8, 0.05)],
+    3: [(3.0, 0.03)]
+}
+
 # --------------------------
 # 边长收集
 # --------------------------
 
-# 边条字典： (订单id, 'W' 或 'H') -> (长度, 单价)
 edges = {}
 for k, v in orders.items():
     edges[(k, 'W')] = (v['width'], v['price'])
     edges[(k, 'H')] = (v['height'], v['price'])
 
 # --------------------------
-# 枚举所有切割模式
+# 判断是否与缺陷重叠
 # --------------------------
 
-def generate_patterns(material_len):
+def overlaps_with_defects(start, length, defects):
+    for defect_start, defect_len in defects:
+        defect_end = defect_start + defect_len
+        if not (start + length <= defect_start or start >= defect_end):
+            return True
+    return False
+
+# --------------------------
+# 模式生成，含剪枝优化
+# --------------------------
+
+def generate_patterns_with_defects(material_len, defects):
     patterns = []
-    max_cuts = int(material_len / min(e[0] for e in edges.values())) + 1
-    for counts in itertools.product(range(0, 6), repeat=8):  # 最多切 5 根边，8 种边
-        total_len = 0
-        total_cuts = sum(counts)
-        if total_cuts == 0:
+    edge_items = list(edges.items())
+
+    for counts in itertools.product(range(0, 6), repeat=len(edge_items)):
+        total_pieces = sum(counts)
+        if total_pieces == 0 or total_pieces > 6:
             continue
-        for idx, count in enumerate(counts):
-            edge_len = list(edges.values())[idx][0]
-            total_len += count * edge_len
-        total_len += (total_cuts - 1) * saw_kerf
-        if total_len <= material_len:
+
+        segment_positions = []
+        pos = 0.0
+        valid = True
+        for i, count in enumerate(counts):
+            edge_len = edge_items[i][1][0]
+            for _ in range(count):
+                total_len = edge_len + saw_kerf if segment_positions else edge_len
+                while overlaps_with_defects(pos, total_len, defects):
+                    pos += 0.01
+                    if pos + total_len > material_len:
+                        valid = False
+                        break
+                if not valid or pos + total_len > material_len:
+                    valid = False
+                    break
+                segment_positions.append((pos, total_len))
+                pos += total_len
+            if not valid:
+                break
+
+        if valid:
+            used_len = pos
+            utilization = used_len / material_len
+            if utilization < 0.6:
+                continue  # 剪枝：跳过低利用率模式
+
             pattern = {}
-            for i, key in enumerate(edges.keys()):
+            for i, key in enumerate(edge_items):
                 if counts[i] > 0:
-                    pattern[key] = counts[i]
-            patterns.append((pattern, total_len))
+                    pattern[key[0]] = counts[i]
+            patterns.append((pattern, used_len))
     return patterns
 
 # --------------------------
@@ -60,24 +99,22 @@ def generate_patterns(material_len):
 
 model = pulp.LpProblem("Maximize_Profit", pulp.LpMaximize)
 
-# 模式变量: (材料类型 i, 模式编号 j) -> x_ij 使用次数
 pattern_vars = {}
 all_patterns = {}
 
 for mat_id, mat in materials.items():
-    mat_patterns = generate_patterns(mat["length"])
+    mat_patterns = generate_patterns_with_defects(mat["length"], defect_info.get(mat_id, []))
     for j, (pat, used_len) in enumerate(mat_patterns):
         var = pulp.LpVariable(f"x_{mat_id}_{j}", lowBound=0, cat="Integer")
         pattern_vars[(mat_id, j)] = var
         all_patterns[(mat_id, j)] = {"pattern": pat, "used_len": used_len}
 
-# 每个订单完成的窗框数量变量
 order_vars = {}
 for k in orders:
     order_vars[k] = pulp.LpVariable(f"y_{k}", lowBound=0, upBound=orders[k]["quantity"], cat="Integer")
 
 # --------------------------
-# 目标函数：最大利润
+# 目标函数
 # --------------------------
 
 revenue = sum(order_vars[k] * orders[k]["price"] for k in orders)
@@ -85,7 +122,7 @@ cost = sum(pattern_vars[(i, j)] * materials[i]["cost"] for (i, j) in pattern_var
 model += (revenue - cost)
 
 # --------------------------
-# 约束条件：满足每个订单所需宽边、高边数目
+# 约束条件
 # --------------------------
 
 for k in orders:
@@ -117,6 +154,7 @@ print("\n使用的原材料组合：")
 total_material_cost = 0
 total_used_len = 0
 total_saw_loss = 0
+
 for (i, j), var in pattern_vars.items():
     count = var.varValue
     if count > 0:
@@ -128,7 +166,22 @@ for (i, j), var in pattern_vars.items():
         total_used_len += count * used_len
         total_saw_loss += count * saw_loss
 
+# --------------------------
+# 利用率分析
+# --------------------------
+
+min_edge_len = min(length for length, _ in edges.values())
+edge_scrap_loss = 0.0
+
+for (i, j), var in pattern_vars.items():
+    count = var.varValue
+    if count > 0:
+        mat_len = materials[i]["length"]
+        used_len = all_patterns[(i, j)]["used_len"]
+        leftover = mat_len - used_len
+        if leftover < min_edge_len + saw_kerf:
+            edge_scrap_loss += leftover * count
+
 print(f"\n总原材料长度使用: {total_used_len:.3f} 米")
 print(f"总锯口损失: {total_saw_loss:.3f} 米")
-print(f"切割利用率: {(total_used_len - total_saw_loss) / total_used_len:.2%}")
-print(f"锯口损失率: {total_saw_loss / total_used_len:.2%}")
+print(f"总边角浪费: {edge_scrap_loss:.3f} 米")

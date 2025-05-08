@@ -1,4 +1,4 @@
-#计算利用率时未考虑舍弃部分
+#问题一代码
 import pulp
 import itertools
 
@@ -9,10 +9,10 @@ import itertools
 saw_kerf = 0.005  # 锯口宽度
 
 orders = {
-    1: {"width": 1.6, "height": 2.2, "tolerance": 0.01, "quantity": 10, "price": 48},
-    2: {"width": 1.8, "height": 2.4, "tolerance": 0.01, "quantity": 20, "price": 68},
-    3: {"width": 1.7, "height": 2.3, "tolerance": 0.01, "quantity": 20, "price": 55},
-    4: {"width": 1.5, "height": 2.0, "tolerance": 0.01, "quantity": 15, "price": 42},
+    1: {"width": 1.6, "height": 2.2, "tolerance": 0.01, "quantity": 10, "price": 480},
+    2: {"width": 1.8, "height": 2.4, "tolerance": 0.01, "quantity": 20, "price": 680},
+    3: {"width": 1.7, "height": 2.3, "tolerance": 0.01, "quantity": 20, "price": 550},
+    4: {"width": 1.5, "height": 2.0, "tolerance": 0.01, "quantity": 15, "price": 420},
 }
 
 materials = {
@@ -25,7 +25,6 @@ materials = {
 # 边长收集
 # --------------------------
 
-# 边条字典： (订单id, 'W' 或 'H') -> (长度, 单价)
 edges = {}
 for k, v in orders.items():
     edges[(k, 'W')] = (v['width'], v['price'])
@@ -37,7 +36,6 @@ for k, v in orders.items():
 
 def generate_patterns(material_len):
     patterns = []
-    max_cuts = int(material_len / min(e[0] for e in edges.values())) + 1
     for counts in itertools.product(range(0, 6), repeat=8):  # 最多切 5 根边，8 种边
         total_len = 0
         total_cuts = sum(counts)
@@ -61,7 +59,6 @@ def generate_patterns(material_len):
 
 model = pulp.LpProblem("Maximize_Profit", pulp.LpMaximize)
 
-# 模式变量: (材料类型 i, 模式编号 j) -> x_ij 使用次数
 pattern_vars = {}
 all_patterns = {}
 
@@ -72,13 +69,12 @@ for mat_id, mat in materials.items():
         pattern_vars[(mat_id, j)] = var
         all_patterns[(mat_id, j)] = {"pattern": pat, "used_len": used_len}
 
-# 每个订单完成的窗框数量变量
 order_vars = {}
 for k in orders:
     order_vars[k] = pulp.LpVariable(f"y_{k}", lowBound=0, upBound=orders[k]["quantity"], cat="Integer")
 
 # --------------------------
-# 目标函数：最大利润
+# 目标函数
 # --------------------------
 
 revenue = sum(order_vars[k] * orders[k]["price"] for k in orders)
@@ -86,7 +82,7 @@ cost = sum(pattern_vars[(i, j)] * materials[i]["cost"] for (i, j) in pattern_var
 model += (revenue - cost)
 
 # --------------------------
-# 约束条件：满足每个订单所需宽边、高边数目
+# 约束条件
 # --------------------------
 
 for k in orders:
@@ -129,7 +125,25 @@ for (i, j), var in pattern_vars.items():
         total_used_len += count * used_len
         total_saw_loss += count * saw_loss
 
+# --------------------------
+# 考虑边角浪费后的利用率计算
+# --------------------------
+
+min_edge_len = min(length for length, _ in edges.values())
+edge_scrap_loss = 0.0
+for (i, j), var in pattern_vars.items():
+    count = var.varValue
+    if count > 0:
+        mat_len = materials[i]["length"]
+        used_len = all_patterns[(i, j)]["used_len"]
+        leftover = mat_len - used_len
+        if leftover < min_edge_len + saw_kerf:
+            edge_scrap_loss += leftover * count
+
 print(f"\n总原材料长度使用: {total_used_len:.3f} 米")
 print(f"总锯口损失: {total_saw_loss:.3f} 米")
-print(f"切割利用率: {(total_used_len - total_saw_loss) / total_used_len:.2%}")
-print(f"锯口损失率: {total_saw_loss / total_used_len:.2%}")
+print(f"总边角浪费: {edge_scrap_loss:.3f} 米")
+
+total_real_loss = total_saw_loss + edge_scrap_loss
+print(f"切割利用率: {(total_used_len - total_real_loss) / total_used_len:.2%}")
+print(f"总损失率（锯口 + 边角浪费）: {total_real_loss / total_used_len:.2%}")
